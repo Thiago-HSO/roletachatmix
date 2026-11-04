@@ -252,8 +252,19 @@ body{height:100dvh;min-height:0;overflow:hidden;display:flex;flex-direction:colu
       </div>
       <div class="stats" id="stats"></div>
       <div class="table-wrap">
-        <table><thead><tr><th>Data/Hora</th><th>Nome</th><th>Telefone</th><th>Cliente</th><th>Brinde</th></tr></thead>
+        <table><thead><tr><th>Data/Hora</th><th>Nome</th><th>Telefone</th><th>Cliente</th><th>Brinde</th><th>Forms</th></tr></thead>
         <tbody id="leadRows"></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Google Forms (cópia na nuvem)</h3>
+      <p class="small" id="syncStatus"></p>
+      <label class="field" style="margin:12px 0 10px"><span>Link pré-preenchido do formulário</span>
+        <input type="text" id="formLink" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://docs.google.com/forms/d/e/.../viewform?usp=pp_url&entry...."></label>
+      <div class="btns">
+        <button class="mini" id="formSave">Salvar e enviar teste</button>
+        <button class="mini ghost" id="formSync">Enviar pendentes agora</button>
       </div>
     </div>
 
@@ -295,6 +306,7 @@ const PRIZES = [
 ];
 const STORE = 'cmx-r2';
 const DEFAULT_PIN = '2026';
+const DEFAULT_FORM_LINK = 'https://docs.google.com/forms/d/e/1FAIpQLScYTvcZMDHKNMYZayjLJZUr43LKx4FTurpg6eeMeyj1dhqlaQ/viewform?usp=pp_url&entry.297762512=NOME&entry.781763300=TELEFONE&entry.1068945758=CLIENTE&entry.1674156498=BRINDE&entry.889901461=DATA&entry.1651807712=ID';
 
 // ---------- Utilidades ----------
 const $ = id => document.getElementById(id);
@@ -335,7 +347,9 @@ function normalize(s){
     counters: { sim: num(s.counters && s.counters.sim, 0), nao: num(s.counters && s.counters.nao, 0) },
     blockRepeat: s.blockRepeat !== false,
     pin: s.pin || hash(DEFAULT_PIN),
-    leads: Array.isArray(s.leads) ? s.leads : [],
+    formLink: typeof s.formLink === 'string' ? s.formLink : DEFAULT_FORM_LINK,
+    leads: (Array.isArray(s.leads) ? s.leads : []).filter(l => l && l.data && l.telefone)
+      .map(l => ({ ...l, id: l.id || `${l.data}-${l.telefone}` })),
     rev: num(s.rev, 0),
   };
 }
@@ -408,7 +422,75 @@ async function loadBest(){
   ready = true;
   save();       // deixa os 3 lugares iguais
   refresh();
+  syncLeads();
 }
+
+// ---------- Envio para o Google Forms (cópia de segurança fora do iPad) ----------
+// O link pré-preenchido do Forms traz as palavras-chave NOME, TELEFONE, CLIENTE, BRINDE, DATA e ID
+// em cada pergunta. Daqui saem o endereço de envio e o código (entry.xxx) de cada campo.
+const FORM_KEYS = ['NOME', 'TELEFONE', 'CLIENTE', 'BRINDE', 'DATA', 'ID'];
+function parseFormLink(link){
+  let u;
+  try { u = new URL(link.trim()); } catch(e){ return { error:'Link inválido.' }; }
+  if (!/(^|\.)docs\.google\.com$/.test(u.hostname) || !/\/forms\/.*\/viewform/.test(u.pathname)){
+    return { error:'Use o link pré-preenchido do Google Forms (docs.google.com/forms/…/viewform?…).' };
+  }
+  const map = {};
+  u.searchParams.forEach((v, k) => {
+    const key = v.trim().toUpperCase();
+    if (/^entry\.\d+$/.test(k) && FORM_KEYS.includes(key)) map[key] = k;
+  });
+  const missing = ['NOME', 'TELEFONE', 'CLIENTE', 'BRINDE'].filter(k => !map[k]);
+  if (missing.length) return { error:'Faltou preencher no link: ' + missing.join(', ') + '.' };
+  return { action: u.origin + u.pathname.replace(/\/viewform$/, '/formResponse'), map };
+}
+
+const sync = { busy:false, error:'', at:null };
+function sendToForm(cfg, l){
+  const body = new URLSearchParams();
+  const vals = {
+    NOME: l.nome, TELEFONE: fmtPhone(l.telefone), CLIENTE: l.cliente === 'sim' ? 'Sim' : 'Não',
+    BRINDE: l.brinde, DATA: new Date(l.data).toLocaleString('pt-BR'), ID: l.id,
+  };
+  Object.entries(cfg.map).forEach(([k, entry]) => body.append(entry, vals[k]));
+  // O Google não deixa ler a resposta (no-cors). Se não houver erro de rede, o envio chegou.
+  return fetch(cfg.action, { method:'POST', mode:'no-cors', body });
+}
+async function syncLeads(){
+  if (sync.busy || !state.formLink) { renderSync(); return; }
+  const cfg = parseFormLink(state.formLink);
+  if (cfg.error){ sync.error = cfg.error; renderSync(); return; }
+  const pend = state.leads.filter(l => !l.synced);
+  if (!pend.length) { renderSync(); return; }
+  sync.busy = true; renderSync();
+  for (const l of pend.slice(0, 20)){
+    try {
+      await sendToForm(cfg, l);
+      l.synced = true;
+      sync.error = ''; sync.at = new Date();
+      save();
+    } catch(e){
+      sync.error = navigator.onLine === false ? 'Sem internet, envio automático quando voltar' : 'Não conectou ao Forms, tentando de novo';
+      break;
+    }
+  }
+  sync.busy = false;
+  renderSync();
+  if (!sync.error && state.leads.some(l => !l.synced)) setTimeout(syncLeads, 300);
+}
+
+function renderSync(){
+  const el = $('syncStatus');
+  if (!el) return;
+  const total = state.leads.length, pend = state.leads.filter(l => !l.synced).length;
+  if (!state.formLink){ el.innerHTML = 'Google Forms não configurado. Os leads ficam só no iPad.'; return; }
+  el.innerHTML = `Enviados: <b>${total - pend}</b> · Pendentes: <b>${pend}</b>`
+    + (sync.busy ? ' · enviando…' : '')
+    + (sync.error ? `<br><span style="color:#c0392b">${esc(sync.error)}</span>` : '')
+    + (sync.at ? `<br>Último envio: ${sync.at.toLocaleTimeString('pt-BR')}` : '');
+}
+setInterval(syncLeads, 30000);
+window.addEventListener('online', syncLeads);
 
 function renderSaveStatus(){
   const el = $('saveStatus');
@@ -629,8 +711,10 @@ leadForm.addEventListener('submit', e => {
 
   const c = state.prizes[prize.id];
   if (c.stock !== null) c.stock = Math.max(0, c.stock - 1);
-  state.leads.push({ data:new Date().toISOString(), nome, telefone, cliente, brinde:prize.name });
+  const data = new Date().toISOString();
+  state.leads.push({ id:`${Date.now().toString(36)}-${rand(1e9).toString(36)}`, data, nome, telefone, cliente, brinde:prize.name, synced:false });
   save();
+  syncLeads();
 
   $('leadDlg').close();
   document.activeElement && document.activeElement.blur();
@@ -671,8 +755,10 @@ function openAdmin(){
   $('newPin').value = '';
   const canShare = !!(navigator.canShare && navigator.canShare({ files:[new File([''], 'a.csv', { type:'text/csv' })] }));
   $('shareBtn').hidden = $('backupShareBtn').hidden = !canShare;
+  $('formLink').value = state.formLink;
   renderAdminInfo();
   renderSaveStatus();
+  renderSync();
   $('admin').showModal();
 }
 
@@ -685,8 +771,10 @@ function renderAdminInfo(){
   $('stats').innerHTML = Object.entries(stats).map(([k,v]) => `<span class="stat">${esc(k)}: <b>${v}</b></span>`).join('');
   $('leadRows').innerHTML = state.leads.slice(-50).reverse().map(l => `<tr>
     <td>${new Date(l.data).toLocaleString('pt-BR')}</td><td>${esc(l.nome)}</td><td>${fmtPhone(l.telefone)}</td>
-    <td>${l.cliente === 'sim' ? 'Sim' : 'Não'}</td><td>${esc(l.brinde)}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="small">Nenhum lead ainda.</td></tr>';
+    <td>${l.cliente === 'sim' ? 'Sim' : 'Não'}</td><td>${esc(l.brinde)}</td>
+    <td title="${l.synced ? 'Enviado ao Forms' : 'Aguardando envio'}">${state.formLink ? (l.synced ? '✅' : '⏳') : ''}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="small">Nenhum lead ainda.</td></tr>';
+  renderSync();
 }
 
 function readAdminForm(){
@@ -704,7 +792,7 @@ function readAdminForm(){
 }
 
 $('admin').addEventListener('input', e => {
-  if (e.target.id === 'newPin') return;
+  if (['newPin', 'formLink'].includes(e.target.id)) return;
   readAdminForm(); save(); renderAdminInfo(); refresh();
 });
 $('adminSave').addEventListener('click', () => { readAdminForm(); save(); refresh(); $('admin').close(); });
@@ -712,6 +800,23 @@ $('resetCounters').addEventListener('click', () => {
   if (!confirm('Zerar os contadores de chaveiros?')) return;
   state.counters = { sim:0, nao:0 }; save(); renderAdminInfo();
 });
+$('formSave').addEventListener('click', async () => {
+  const link = $('formLink').value.trim();
+  if (!link){ state.formLink = ''; save(); renderSync(); return; }
+  const cfg = parseFormLink(link);
+  if (cfg.error){ alert('❌ ' + cfg.error); return; }
+  state.formLink = link; sync.error = ''; save();
+  try {
+    await sendToForm(cfg, { id:'TESTE', nome:'TESTE DA ROLETA', telefone:'00000000000', cliente:'nao', brinde:'Teste de conexão', data:new Date().toISOString() });
+    alert('✅ Teste enviado! Confira as respostas do formulário: deve aparecer "TESTE DA ROLETA".');
+    syncLeads();
+  } catch(e){
+    sync.error = 'Não conectou ao Forms. Confira a internet.';
+    alert('❌ ' + sync.error); renderSync();
+  }
+});
+$('formSync').addEventListener('click', () => { sync.error = ''; syncLeads(); });
+
 $('savePin').addEventListener('click', () => {
   const v = $('newPin').value.trim();
   if (v.length < 4){ alert('O PIN precisa ter pelo menos 4 dígitos.'); return; }
