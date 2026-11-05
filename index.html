@@ -229,14 +229,14 @@ body{height:100dvh;min-height:0;overflow:hidden;display:flex;flex-direction:colu
     <div class="card">
       <h3>Regra dos prêmios</h3>
       <div class="rule">
-        <span><b>Já é cliente:</b> 1 prêmio a cada <input class="qty" type="number" min="0" id="everyClient"> chaveiros</span>
+        <span><b>Já é cliente:</b> 1 prêmio a cada <input class="qty" type="number" min="0" id="everyClient"> brindes simples</span>
         <span class="progress" id="progClient"></span>
       </div>
       <div class="rule">
-        <span><b>Não é cliente:</b> 1 prêmio a cada <input class="qty" type="number" min="0" id="everyNew"> chaveiros</span>
+        <span><b>Não é cliente:</b> 1 prêmio a cada <input class="qty" type="number" min="0" id="everyNew"> brindes simples</span>
         <span class="progress" id="progNew"></span>
       </div>
-      <p class="small">O prêmio é sorteado entre os brindes ativos (exceto chaveiro). Use 0 para sempre dar prêmio.</p>
+      <p class="small">Brindes simples = caneta e chaveiro, entregues alternados. O prêmio é sorteado entre os outros brindes ativos. Use 0 para sempre dar prêmio.</p>
       <div class="btns" style="margin-top:10px"><button class="mini ghost" id="resetCounters">Zerar contadores</button></div>
       <label class="check"><input type="checkbox" id="blockRepeat"> Bloquear telefone que já girou</label>
     </div>
@@ -296,6 +296,9 @@ body{height:100dvh;min-height:0;overflow:hidden;display:flex;flex-direction:colu
 'use strict';
 
 const KEY_ID = 'chaveiro';
+// Brindes simples: saem alternados (caneta, chaveiro, caneta…) até chegar a vez de um prêmio melhor.
+const BASIC_IDS = ['caneta', KEY_ID];
+const isBasic = id => BASIC_IDS.includes(id);
 const PRIZES = [
   { id:'caixa',       name:'Caixa de Som',          emoji:'🔊' },
   { id:'massageador', name:'Massageador',           emoji:'💆' },
@@ -303,6 +306,7 @@ const PRIZES = [
   { id:'celular',     name:'Suporte para Celular',  emoji:'📱' },
   { id:'notebook',    name:'Suporte para Notebook', emoji:'💻' },
   { id:'mouse',       name:'Mouse',                 emoji:'🖱️' },
+  { id:'caneta',      name:'Caneta Chatmix',        emoji:'🖊️' },
   { id:KEY_ID,        name:'Chaveiro Chatmix',      emoji:'🔑' },
 ];
 const STORE = 'cmx-r2';
@@ -346,6 +350,7 @@ function normalize(s){
     everyClient: num(s.everyClient, 6),
     everyNew: num(s.everyNew, 12),
     counters: { sim: num(s.counters && s.counters.sim, 0), nao: num(s.counters && s.counters.nao, 0) },
+    nextBasic: num(s.nextBasic, 0) % BASIC_IDS.length,
     blockRepeat: s.blockRepeat !== false,
     pin: s.pin || hash(DEFAULT_PIN),
     formLink: typeof s.formLink === 'string' ? s.formLink : DEFAULT_FORM_LINK,
@@ -505,34 +510,39 @@ const isAvailable = id => {
   const c = state.prizes[id];
   return c.active && (c.stock === null || c.stock > 0);
 };
-const premiums = () => PRIZES.filter(p => p.id !== KEY_ID && isAvailable(p.id));
+const premiums = () => PRIZES.filter(p => !isBasic(p.id) && isAvailable(p.id));
+const basics = () => BASIC_IDS.filter(isAvailable).map(id => PRIZES.find(p => p.id === id));
 
 // ---------- Decisão do brinde ----------
-// A cada N chaveiros entregues ao grupo (cliente / não cliente), o próximo giro ganha um prêmio aleatório.
+// A cada N brindes simples (caneta/chaveiro) entregues ao grupo (cliente / não cliente),
+// o próximo giro ganha um prêmio aleatório. Os simples se alternam: caneta, chaveiro, caneta…
 function decide(cliente){
   const every = cliente === 'sim' ? state.everyClient : state.everyNew;
   const prem = premiums();
-  const keyOk = isAvailable(KEY_ID);
-  if (!keyOk && !prem.length) return null;
+  const bas = basics();
+  if (!bas.length && !prem.length) return null;
 
-  const givePremium = prem.length && (!keyOk || state.counters[cliente] >= every);
+  const givePremium = prem.length && (!bas.length || state.counters[cliente] >= every);
   if (givePremium){
     state.counters[cliente] = 0;
     return prem[rand(prem.length)];
   }
   state.counters[cliente]++;
-  return PRIZES.find(p => p.id === KEY_ID);
+  // a vez é de BASIC_IDS[nextBasic]; se ele estiver desligado ou esgotado, sai o outro
+  const want = BASIC_IDS[state.nextBasic];
+  const pick = bas.find(p => p.id === want) || bas[0];
+  state.nextBasic = (BASIC_IDS.indexOf(pick.id) + 1) % BASIC_IDS.length;
+  return pick;
 }
 
-// ---------- Roleta: chaveiro intercalado entre os prêmios ----------
+// ---------- Roleta: caneta e chaveiro intercalados entre os prêmios ----------
 function buildSegments(){
   const prem = premiums();
-  const keyOk = isAvailable(KEY_ID);
-  const key = PRIZES.find(p => p.id === KEY_ID);
-  if (!prem.length) return keyOk ? [key, key] : [];
-  if (!keyOk) return prem;
+  const bas = basics();
+  if (!prem.length) return bas.length === 1 ? [bas[0], bas[0]] : bas.concat(bas);
+  if (!bas.length) return prem;
   const out = [];
-  prem.forEach(p => { out.push(p); out.push(key); });
+  prem.forEach((p, i) => { out.push(p); out.push(bas[i % bas.length]); });
   return out;
 }
 
@@ -572,8 +582,8 @@ function drawWheel(){
   ctx.translate(R, R);
   ctx.rotate(rotation * Math.PI / 180);
   segments.forEach((p, i) => {
-    const isKey = p.id === KEY_ID;
-    const c = isKey ? (segments.every(s => s.id === KEY_ID) && i % 2 ? KEY_ALT : KEY_COLOR) : PREMIUM_COLORS[premIdx++ % 2];
+    const c = p.id === KEY_ID ? KEY_COLOR : isBasic(p.id) ? KEY_ALT
+      : PREMIUM_COLORS[premIdx++ % 2];
     const a0 = -Math.PI/2 + i*seg;
     ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,R-4,a0,a0+seg); ctx.closePath();
     ctx.fillStyle = c.bg; ctx.fill();
@@ -764,8 +774,8 @@ function openAdmin(){
 }
 
 function renderAdminInfo(){
-  $('progClient').innerHTML = `Agora: <b>${state.counters.sim}/${state.everyClient}</b> chaveiros`;
-  $('progNew').innerHTML = `Agora: <b>${state.counters.nao}/${state.everyNew}</b> chaveiros`;
+  $('progClient').innerHTML = `Agora: <b>${state.counters.sim}/${state.everyClient}</b> brindes simples`;
+  $('progNew').innerHTML = `Agora: <b>${state.counters.nao}/${state.everyNew}</b> brindes simples`;
   $('leadCount').textContent = state.leads.length;
   const stats = {};
   state.leads.forEach(l => stats[l.brinde] = (stats[l.brinde] || 0) + 1);
@@ -798,7 +808,7 @@ $('admin').addEventListener('input', e => {
 });
 $('adminSave').addEventListener('click', () => { readAdminForm(); save(); refresh(); $('admin').close(); });
 $('resetCounters').addEventListener('click', () => {
-  if (!confirm('Zerar os contadores de chaveiros?')) return;
+  if (!confirm('Zerar os contadores de brindes simples?')) return;
   state.counters = { sim:0, nao:0 }; save(); renderAdminInfo();
 });
 $('formSave').addEventListener('click', async () => {
